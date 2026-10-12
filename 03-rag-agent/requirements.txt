@@ -1,0 +1,14 @@
+# LangGraph
+langgraph>=1.0,<2.0
+
+# LangChain core
+langchain-core>=1.0,<2.0
+
+# OpenAI integration
+langchain-openai>=1.0,<2.0
+
+# Environment variables
+python-dotenv>=1.0,<2.0
+
+# api request
+requests>=2.32.0,<3.0.0
