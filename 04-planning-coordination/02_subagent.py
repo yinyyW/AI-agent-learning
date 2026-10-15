@@ -60,8 +60,16 @@ REASONING
 
 """.strip()
 
+# s06: subagent gets its own system prompt — no task, no recursion
+sub_system_prompt = """
+    f"You are a forked worker process at {WORKDIR}. You are NOT the main agent.  "
+    "Complete the task you were given, then return a concise summary. "
+    "Do not delegate further."
+"""
+
 WORKDIR = Path.cwd()
 CURRENT_TODOS: list[dict] = []
+MAX_TURNS = 30
 
 from collections.abc import Mapping
 from typing import Any
@@ -166,6 +174,70 @@ def run_todo_write(todos: list | str | None) -> str:
     return f"Updated {len(CURRENT_TODOS)} tasks"
 
 # ═══════════════════════════════════════════════════════════
+#  spawn_subagent tool
+# ═══════════════════════════════════════════════════════════
+def spawn_subagent(description: str) -> str:
+    print(f"\n\033[35m[Subagent spawned]\033[0m")
+    messages: list[ChatCompletionMessageParam] = [{ "role": "system", "content": sub_system_prompt }, { "role": "user", "content": description }]  # fresh context
+    for _ in range(0, MAX_TURNS):
+        response = client.chat.completions.create(model=model_name, messages=messages, tools=TOOLS)
+        assistant_message = response.choices[0].message
+        messages.append(cast(ChatCompletionMessageParam, assistant_message))
+        print(f"\n{'=' * 20} Subagent Loop {_} {'=' * 20}")
+        # 1. 输出 AI 文本回复
+        if assistant_message.content:
+            print(f"[AI]\n{assistant_message.content}")
+
+        # 2. 输出工具调用
+        if assistant_message.tool_calls:
+            for i, tool_call in enumerate(assistant_message.tool_calls, start=1):
+                if tool_call.type != "function":
+                    continue
+                print(f"\n[Tool Call {i}]")
+                print(f"  Name: {tool_call.function.name}")
+                print(f"  Arguments: {tool_call.function.arguments}")
+
+        # 3. 输出拒绝信息（如果有）
+        if assistant_message.refusal:
+            print(f"\n[Refusal]\n{assistant_message.refusal}")
+
+        print(f"{'=' * 50}\n")
+        if not assistant_message.tool_calls:
+            force = trigger_hooks("Stop", messages)
+            if force:
+                messages.append({ "role": "assistant", "content": force })
+                continue
+            break
+        for tc in assistant_message.tool_calls:
+            if tc.type == "function":
+                blocked = trigger_hooks("PreToolUse", tc)
+                if blocked:
+                    messages.append({
+                                        "role": "tool",
+                                        "tool_call_id": tc.id,
+                                        "content": "Permission denied"
+                                    })
+                    continue
+                tool_name = tc.function.name
+                tool_args = json.loads(tc.function.arguments)
+                tool = TOOL_HANDLERS[tool_name]
+                output = tool(**tool_args) if tool else f"Unknown: {tool_name}"
+                print(f"Tool {tool_name}({tool_args}) -> {str(output)[:200]}")
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": str(output)
+                })
+    # 4. 提取最终回复
+    result = ""
+    for m in reversed(messages):
+        if _get_field(m, "role") == "assistant":
+            result = _get_field(m, "content")
+    result = result or "Subagent stopped without final answer."
+    print(f"\033[35m[Subagent done]\033[0m")
+    return result
+
+# ═══════════════════════════════════════════════════════════
 #  工具定义
 # ═══════════════════════════════════════════════════════════
 TOOLS: list[ChatCompletionFunctionToolParam] = [
@@ -266,7 +338,98 @@ TOOLS: list[ChatCompletionFunctionToolParam] = [
                 "required": ["todos"]
             }
         },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "task",
+            "description": "Launch a subagent to handle a complex subtask. Returns only the final conclusion.",
+            "parameters": {
+                "type": "object", 
+                "properties": {
+                    "description": {"type": "string"}
+                },
+                "required": ["description"]
+            }
+        },
     }
+]
+
+SUB_TOOLS: list[ChatCompletionFunctionToolParam] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "bash",
+            "description": "Run a shell command.",
+            "parameters": {
+                "type": "object", 
+                "properties": {
+                    "command": {"type": "string"},
+                },
+                "required": ["command"]
+            }
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read file contents.",
+            "parameters": {
+                "type": "object", 
+                "properties": {
+                    "path": {"type": "string"},
+                    "limit": {"type": "integer"}
+                },
+                "required": ["path"]
+            }
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_file",
+            "description": "Write content to a file.",
+            "parameters": {
+                "type": "object", 
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"}
+                },
+                "required": ["path", "content"]
+            }
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "Replace exact text in a file once.",
+            "parameters": {
+                "type": "object", 
+                "properties": {
+                    "path": {"type": "string"},
+                    "old_text": {"type": "string"},
+                    "new_text": {"type": "string"}
+                },
+                "required": ["path", "old_text", "new_text"]
+            }
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "glob",
+            "description": "Find files matching a glob pattern.",
+            "parameters": {
+                "type": "object", 
+                "properties": {
+                    "pattern": {"type": "string"}
+                },
+                "required": ["pattern"]
+            }
+        },
+    },
 ]
 
 # ═══════════════════════════════════════════════════════════
@@ -275,6 +438,12 @@ TOOLS: list[ChatCompletionFunctionToolParam] = [
 TOOL_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
     "edit_file": run_edit, "glob": run_glob, "todo_write": run_todo_write,
+    "task": spawn_subagent,
+}
+
+SUB_HANDLERS = {
+    "bash": run_bash, "read_file": run_read, "write_file": run_write,
+    "edit_file": run_edit, "glob": run_glob,
 }
 
 # ═══════════════════════════════════════════════════════════
@@ -470,14 +639,13 @@ model_name = os.getenv("AI_MODEL_NAME") or "deepseek-flash"
 client = OpenAI(api_key=api_key, base_url=base_url)
 
 def agent_loop(messages: list[ChatCompletionMessageParam]):
-    MAX_TURNS = 20
     rounds_since_todo = 0
     for _ in range(0, MAX_TURNS):
         if rounds_since_todo >= 3:
             messages.append({"role": "user",
                              "content": "<reminder>Update your todos.</reminder>"})
             rounds_since_todo = 0
-        response = client.chat.completions.create(model=model_name, messages=messages, tools=TOOLS)
+        response = client.chat.completions.create(model=model_name, messages=messages, tools=TOOLS, )
         assistant_message = response.choices[0].message
         messages.append(cast(ChatCompletionMessageParam, assistant_message))
         print(f"\n{'=' * 20} Loop {_} {'=' * 20}")
@@ -528,10 +696,9 @@ def agent_loop(messages: list[ChatCompletionMessageParam]):
                 })
 
 if __name__ == "__main__":
-    print("Tool Use — 4 个工具调用")
     print("输入问题，回车发送。输入 q 退出。\n")
-
-    messages: list[ChatCompletionMessageParam] = []
+    print("Subagent — spawn sub-agents with fresh context, summary only")
+    messages: list[ChatCompletionMessageParam] = [{ "role": "system", "content": system_prompt }]
     while True:
         try:
             query = input("\033[36ms00 >> \033[0m")
