@@ -420,6 +420,18 @@ TOOLS: list[ChatCompletionFunctionToolParam] = [
                 "required": ["name"]
             }
         },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "compact",
+            "description": "Summarize earlier conversation to free context space.",
+            "parameters": {
+                "type": "object", 
+                "properties": {},
+                "required": []
+            }
+        },
     }
 ]
 
@@ -709,15 +721,33 @@ api_key = os.getenv("AI_API_KEY")
 base_url = os.getenv("AI_BASE_URL")
 model_name = os.getenv("AI_MODEL_NAME") or "deepseek-flash"
 client = OpenAI(api_key=api_key, base_url=base_url)
+compactor = ContextCompact(llm_client=client,
+                            model=model_name,
+                            tool_results_dir=WORKDIR / ".task_outputs" / "tool-results",
+                            transcript_dir=WORKDIR / ".transcripts")
+MAX_REACTIVE_RETRIES = 1 # 最大重试次数，用于处理上下文压缩失败的情况
 
-def agent_loop(messages: list[ChatCompletionMessageParam]):
+def agent_loop(messages: list[ChatCompletionMessageParam], active_request: str):
     rounds_since_todo = 0
+    reactive_retries = 0
     for _ in range(0, MAX_TURNS):
+        messages[:] = compactor.prepare(messages, active_request)
         if rounds_since_todo >= 3:
             messages.append({"role": "user",
                              "content": "<reminder>Update your todos.</reminder>"})
             rounds_since_todo = 0
-        response = client.chat.completions.create(model=model_name, messages=messages, tools=TOOLS, )
+        try:
+            response = client.chat.completions.create(model=model_name, messages=messages, tools=TOOLS)
+            reactive_retries = 0
+        except Exception as error:
+            too_long = any(text in str(error).lower()
+                           for text in ("prompt_too_long", "too many tokens"))
+            if too_long and reactive_retries < MAX_REACTIVE_RETRIES:
+                print("[reactive compact]")
+                reactive_retries += 1
+                messages[:] = compactor.reactive_compact(messages, active_request)
+                continue
+            raise error
         assistant_message = response.choices[0].message
         messages.append(cast(ChatCompletionMessageParam, assistant_message))
         # 打印回复结果
@@ -746,6 +776,7 @@ def agent_loop(messages: list[ChatCompletionMessageParam]):
             return
         # 执行工具调用
         rounds_since_todo += 1
+        compact_requested = False
         for tc in assistant_message.tool_calls:
             if tc.type == "function":
                 blocked = trigger_hooks("PreToolUse", tc)
@@ -754,6 +785,14 @@ def agent_loop(messages: list[ChatCompletionMessageParam]):
                                         "role": "tool",
                                         "tool_call_id": tc.id,
                                         "content": "Permission denied"
+                                    })
+                    continue
+                if tc.function.name == "compact":
+                    compact_requested = True
+                    messages.append({
+                                        "role": "tool",
+                                        "tool_call_id": tc.id,
+                                        "content": "Compaction requested after this tool batch."
                                     })
                     continue
                 tool_name = tc.function.name
@@ -766,6 +805,8 @@ def agent_loop(messages: list[ChatCompletionMessageParam]):
                     "tool_call_id": tc.id,
                     "content": str(output)
                 })
+        if compact_requested:
+            messages[:] = compactor.compact_history(messages, active_request)
 
 if __name__ == "__main__":
     print("Context Compact - archive, reduce, then summarize")
@@ -780,7 +821,7 @@ if __name__ == "__main__":
         if query.strip().lower() in ("q", "quit", "exit", ""):
             break
         messages.append({ "role": "user", "content": query })
-        agent_loop(messages=messages)
+        agent_loop(messages=messages, active_request=query)
 
         last_message = messages[-1] if messages else None
         print(f"\n{'=' * 20} Test {'=' * 20}\n")
